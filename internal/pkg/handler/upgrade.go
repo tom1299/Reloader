@@ -10,6 +10,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/parnurzeal/gorequest"
 	"github.com/prometheus/client_golang/prometheus"
@@ -27,9 +28,12 @@ import (
 	"k8s.io/client-go/tools/record"
 )
 
+var delayedUpdates = make(map[string]DelayedUpdate)
+
 // GetDeploymentRollingUpgradeFuncs returns all callback funcs for a deployment
 func GetDeploymentRollingUpgradeFuncs() callbacks.RollingUpgradeFuncs {
 	return callbacks.RollingUpgradeFuncs{
+		IdFunc:             callbacks.GetDeploymentId,
 		ItemsFunc:          callbacks.GetDeploymentItems,
 		AnnotationsFunc:    callbacks.GetDeploymentAnnotations,
 		PodAnnotationsFunc: callbacks.GetDeploymentPodAnnotations,
@@ -201,6 +205,7 @@ func PerformAction(clients kube.Clients, config util.Config, upgradeFuncs callba
 		typedAutoAnnotationEnabledValue, foundTypedAuto := annotations[config.TypedAutoAnnotation]
 		excludeConfigmapAnnotationValue, foundExcludeConfigmap := annotations[options.ConfigmapExcludeReloaderAnnotation]
 		excludeSecretAnnotationValue, foundExcludeSecret := annotations[options.SecretExcludeReloaderAnnotation]
+		_, foundDelayedReload := annotations[options.DelayedReloadAnnotation]
 
 		if !found && !foundAuto && !foundTypedAuto && !foundSearchAnn {
 			annotations = upgradeFuncs.PodAnnotationsFunc(i)
@@ -260,7 +265,14 @@ func PerformAction(clients kube.Clients, config util.Config, upgradeFuncs callba
 			if err != nil {
 				return err
 			}
+
+			if foundDelayedReload {
+				CreateDelayedUpdate(clients, config, upgradeFuncs, collectors, recorder, strategy, i, 10*time.Second)
+				continue
+			}
+
 			resourceName := accessor.GetName()
+
 			err = upgradeFuncs.UpdateFunc(clients, config.Namespace, i)
 			if err != nil {
 				message := fmt.Sprintf("Update for '%s' of type '%s' in namespace '%s' failed with error %v", resourceName, upgradeFuncs.ResourceType, config.Namespace, err)

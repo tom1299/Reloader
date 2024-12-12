@@ -13,6 +13,8 @@ var (
 	SecretUpdateOnChangeAnnotation = "secret.reloader.stakater.com/reload"
 	// ReloaderAutoAnnotation is an annotation to detect changes in secrets/configmaps
 	ReloaderAutoAnnotation = "reloader.stakater.com/auto"
+	// DelayedReloadAnnotation is an annotation to delay the reload
+	DelayedReloadAnnotation = "reloader.stakater.com/delayed-reload"
 	// ConfigmapReloaderAutoAnnotation is an annotation to detect changes in configmaps
 	ConfigmapReloaderAutoAnnotation = "configmap.reloader.stakater.com/auto"
 	// SecretReloaderAutoAnnotation is an annotation to detect changes in secrets

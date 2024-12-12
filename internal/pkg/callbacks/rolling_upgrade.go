@@ -2,8 +2,8 @@ package callbacks
 
 import (
 	"context"
-	"time"
 	"fmt"
+	"time"
 
 	"github.com/sirupsen/logrus"
 	"github.com/stakater/Reloader/pkg/kube"
@@ -20,6 +20,8 @@ import (
 
 // ItemsFunc is a generic function to return a specific resource array in given namespace
 type ItemsFunc func(kube.Clients, string) []runtime.Object
+
+type IdFunc func(runtime.Object) string
 
 // ContainersFunc is a generic func to return containers
 type ContainersFunc func(runtime.Object) []v1.Container
@@ -41,6 +43,7 @@ type PodAnnotationsFunc func(runtime.Object) map[string]string
 
 // RollingUpgradeFuncs contains generic functions to perform rolling upgrade
 type RollingUpgradeFuncs struct {
+	IdFunc             IdFunc
 	ItemsFunc          ItemsFunc
 	AnnotationsFunc    AnnotationsFunc
 	PodAnnotationsFunc PodAnnotationsFunc
@@ -49,6 +52,10 @@ type RollingUpgradeFuncs struct {
 	UpdateFunc         UpdateFunc
 	VolumesFunc        VolumesFunc
 	ResourceType       string
+}
+
+func GetDeploymentId(item runtime.Object) string {
+	return item.(*appsv1.Deployment).Name
 }
 
 // GetDeploymentItems returns the deployments in given namespace
