@@ -10,6 +10,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/parnurzeal/gorequest"
 	"github.com/prometheus/client_golang/prometheus"
@@ -38,6 +39,7 @@ type DelayedUpgrade struct {
 	collectors   metrics.Collectors
 	recorder     record.EventRecorder
 	strategy     invokeStrategy
+	delayedFunc  func()
 }
 
 // GetDeploymentRollingUpgradeFuncs returns all callback funcs for a deployment
@@ -224,7 +226,8 @@ func PerformActionOnSingleItem(clients kube.Clients, item runtime.Object, config
 		typedAutoAnnotationEnabledValue, foundTypedAuto := annotations[config.TypedAutoAnnotation]
 		excludeConfigmapAnnotationValue, foundExcludeConfigmap := annotations[options.ConfigmapExcludeReloaderAnnotation]
 		excludeSecretAnnotationValue, foundExcludeSecret := annotations[options.SecretExcludeReloaderAnnotation]
-		delayedUpgradeAnnotationValue, foundDelayedUpgrade := annotations[options.DelayedUpgradeAnnotation]
+		// TODO: Read the delay value
+		_, foundDelayedUpgrade := annotations[options.DelayedUpgradeAnnotation]
 
 		if !found && !foundAuto && !foundTypedAuto && !foundSearchAnn {
 			annotations = upgradeFuncs.PodAnnotationsFunc(item)
@@ -263,7 +266,6 @@ func PerformActionOnSingleItem(clients kube.Clients, item runtime.Object, config
 					logrus.Infof("Added config '%s' to the delayed upgrade for '%s' of type '%s' in namespace '%s'", config.ResourceName, config.ResourceName, config.Type, config.Namespace)
 				}
 			} else {
-				// Create the delayed upgrade
 				logrus.Infof("Creating new delayed upgrade for '%s' of type '%s' in namespace '%s'", config.ResourceName, config.Type, config.Namespace)
 				delayedUpgrade := DelayedUpgrade{
 					ItemID:       config.ResourceName,
@@ -274,14 +276,14 @@ func PerformActionOnSingleItem(clients kube.Clients, item runtime.Object, config
 					collectors:   collectors,
 					recorder:     recorder,
 					strategy:     strategy,
+					delayedFunc: func() {
+						<-time.After(10 * time.Second)
+						logrus.Infof("Timer fired for '%s' of type '%s' in namespace '%s'", config.ResourceName, config.Type, config.Namespace)
+						PerformDelayedUpgrade(config.ResourceName)
+					},
 				}
 				DelayedUpgrades[config.ResourceName] = delayedUpgrade
-				// Create a timer to call the function PerformDelayedUpgrade after a 10 second delay
-				go func(itemId string) {
-					logrus.Infof("Starting timer for delayed upgrade for '%s'", itemId)
-					PerformDelayedUpgrade(itemId)
-				}
-
+				go delayedUpgrade.delayedFunc()
 			}
 
 			continue
