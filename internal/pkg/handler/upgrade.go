@@ -40,6 +40,7 @@ type DelayedUpgrade struct {
 	recorder     record.EventRecorder
 	strategy     invokeStrategy
 	delayedFunc  func()
+	updating     bool
 }
 
 // GetDeploymentRollingUpgradeFuncs returns all callback funcs for a deployment
@@ -217,7 +218,11 @@ func PerformAction(clients kube.Clients, config util.Config, upgradeFuncs callba
 }
 
 func PerformActionOnSingleItem(clients kube.Clients, item runtime.Object, configs []util.Config, upgradeFuncs callbacks.RollingUpgradeFuncs, collectors metrics.Collectors, recorder record.EventRecorder, strategy invokeStrategy) error {
+	var atLeastOneUpdate constants.Result
+
+	var lastUpdatedConfig util.Config
 	for _, config := range configs {
+		lastUpdatedConfig = config
 
 		annotations := upgradeFuncs.AnnotationsFunc(item)
 		annotationValue, found := annotations[config.Annotation]
@@ -255,20 +260,27 @@ func PerformActionOnSingleItem(clients kube.Clients, item runtime.Object, config
 		}
 
 		if foundDelayedUpgrade {
-			logrus.Infof("Found delayed upgrade annotation for '%s' of type '%s' in namespace '%s'", config.ResourceName, config.Type, config.Namespace)
-			if _, ok := DelayedUpgrades[config.ResourceName]; ok {
-				logrus.Infof("Delayed upgrade for '%s' of type '%s' in namespace '%s' already exists", config.ResourceName, config.Type, config.Namespace)
-				delayedUpgrade := DelayedUpgrades[config.ResourceName]
-				if _, ok := delayedUpgrade.configs[config.ResourceName]; ok {
-					logrus.Infof("Config '%s' is already part of the delayed upgrade for '%s' of type '%s' in namespace '%s'", config.ResourceName, config.ResourceName, config.Type, config.Namespace)
+			accessor, _ := meta.Accessor(item)
+			itemId := accessor.GetName()
+			logrus.Infof("Found delayed upgrade annotation for '%s' in namespace '%s'", itemId, config.Namespace)
+			if _, ok := DelayedUpgrades[itemId]; ok {
+				logrus.Infof("Delayed upgrade for '%s' already exists", itemId)
+
+				delayedUpgrade := DelayedUpgrades[itemId]
+				if delayedUpgrade.updating {
+					logrus.Infof("Delayed upgrade for '%s' is already in progress", itemId)
+				} else if _, ok := delayedUpgrade.configs[config.ResourceName]; ok {
+					logrus.Infof("Config '%s' is already part of the delayed upgrade for '%s'", config.ResourceName, itemId)
+					continue
 				} else {
 					delayedUpgrade.configs[config.ResourceName] = config
-					logrus.Infof("Added config '%s' to the delayed upgrade for '%s' of type '%s' in namespace '%s'", config.ResourceName, config.ResourceName, config.Type, config.Namespace)
+					logrus.Infof("Added config '%s' to the delayed upgrade for '%s'", config.ResourceName, itemId)
+					continue
 				}
 			} else {
-				logrus.Infof("Creating new delayed upgrade for '%s' of type '%s' in namespace '%s'", config.ResourceName, config.Type, config.Namespace)
+				logrus.Infof("Creating new delayed upgrade for '%s' for config '%s'", itemId, config.ResourceName)
 				delayedUpgrade := DelayedUpgrade{
-					ItemID:       config.ResourceName,
+					ItemID:       itemId,
 					namespace:    config.Namespace,
 					clients:      clients,
 					configs:      map[string]util.Config{config.ResourceName: config},
@@ -276,24 +288,29 @@ func PerformActionOnSingleItem(clients kube.Clients, item runtime.Object, config
 					collectors:   collectors,
 					recorder:     recorder,
 					strategy:     strategy,
+					updating:     false,
 					delayedFunc: func() {
 						<-time.After(10 * time.Second)
-						logrus.Infof("Timer fired for '%s' of type '%s' in namespace '%s'", config.ResourceName, config.Type, config.Namespace)
-						PerformDelayedUpgrade(config.ResourceName)
+						logrus.Infof("Timer fired for delayed upgrade for '%s'", itemId)
+						PerformDelayedUpgrade(itemId)
 					},
 				}
-				DelayedUpgrades[config.ResourceName] = delayedUpgrade
+				DelayedUpgrades[itemId] = delayedUpgrade
 				go delayedUpgrade.delayedFunc()
+				continue
 			}
 
-			continue
 		}
+
+		logrus.Infof("Checking for changes in '%s' of type '%s' in namespace '%s'", config.ResourceName, config.Type, config.Namespace)
 
 		result := constants.NotUpdated
 		reloaderEnabled, _ := strconv.ParseBool(reloaderEnabledValue)
 		typedAutoAnnotationEnabled, _ := strconv.ParseBool(typedAutoAnnotationEnabledValue)
 		if reloaderEnabled || typedAutoAnnotationEnabled || reloaderEnabledValue == "" && typedAutoAnnotationEnabledValue == "" && options.AutoReloadAll {
+			logrus.Infof("Auto reload enabled for '%s' of type '%s' in namespace '%s'", config.ResourceName, config.Type, config.Namespace)
 			result = strategy(upgradeFuncs, item, config, true)
+			logrus.Infof("Auto reload result for '%s' of type '%s' in namespace '%s' is %s", config.ResourceName, config.Type, config.Namespace, result)
 		}
 
 		if result != constants.Updated && annotationValue != "" {
@@ -311,47 +328,54 @@ func PerformActionOnSingleItem(clients kube.Clients, item runtime.Object, config
 		}
 
 		if result != constants.Updated && searchAnnotationValue == "true" {
+			logrus.Infof("Auto search enabled for '%s' of type '%s' in namespace '%s'", config.ResourceName, config.Type, config.Namespace)
 			matchAnnotationValue := config.ResourceAnnotations[options.SearchMatchAnnotation]
 			if matchAnnotationValue == "true" {
 				result = strategy(upgradeFuncs, item, config, true)
 			}
 		}
-
+		logrus.Info("Result for %s after checking annotations is %s", config.ResourceName, result)
 		if result == constants.Updated {
-			accessor, err := meta.Accessor(item)
-			if err != nil {
-				return err
+			logrus.Infof("Setting atLeastOneUpdate to Updated")
+			atLeastOneUpdate = constants.Updated
+		}
+	}
+
+	logrus.Infof("Result is %s", atLeastOneUpdate)
+	if atLeastOneUpdate == constants.Updated {
+		accessor, err := meta.Accessor(item)
+		if err != nil {
+			return err
+		}
+		resourceName := accessor.GetName()
+		err = upgradeFuncs.UpdateFunc(clients, lastUpdatedConfig.Namespace, item)
+		if err != nil {
+			message := fmt.Sprintf("Update for '%s' of type '%s' in namespace '%s' failed with error %v", resourceName, upgradeFuncs.ResourceType, lastUpdatedConfig.Namespace, err)
+			logrus.Errorf("Update for '%s' of type '%s' in namespace '%s' failed with error %v", resourceName, upgradeFuncs.ResourceType, lastUpdatedConfig.Namespace, err)
+
+			collectors.Reloaded.With(prometheus.Labels{"success": "false"}).Inc()
+			collectors.ReloadedByNamespace.With(prometheus.Labels{"success": "false", "namespace": lastUpdatedConfig.Namespace}).Inc()
+			if recorder != nil {
+				recorder.Event(item, v1.EventTypeWarning, "ReloadFail", message)
 			}
-			resourceName := accessor.GetName()
-			err = upgradeFuncs.UpdateFunc(clients, config.Namespace, item)
-			if err != nil {
-				message := fmt.Sprintf("Update for '%s' of type '%s' in namespace '%s' failed with error %v", resourceName, upgradeFuncs.ResourceType, config.Namespace, err)
-				logrus.Errorf("Update for '%s' of type '%s' in namespace '%s' failed with error %v", resourceName, upgradeFuncs.ResourceType, config.Namespace, err)
+			return err
+		} else {
+			message := fmt.Sprintf("Changes detected in '%s' of type '%s' in namespace '%s'", lastUpdatedConfig.ResourceName, lastUpdatedConfig.Type, lastUpdatedConfig.Namespace)
+			message += fmt.Sprintf(", Updated '%s' of type '%s' in namespace '%s'", resourceName, upgradeFuncs.ResourceType, lastUpdatedConfig.Namespace)
 
-				collectors.Reloaded.With(prometheus.Labels{"success": "false"}).Inc()
-				collectors.ReloadedByNamespace.With(prometheus.Labels{"success": "false", "namespace": config.Namespace}).Inc()
-				if recorder != nil {
-					recorder.Event(item, v1.EventTypeWarning, "ReloadFail", message)
-				}
-				return err
-			} else {
-				message := fmt.Sprintf("Changes detected in '%s' of type '%s' in namespace '%s'", config.ResourceName, config.Type, config.Namespace)
-				message += fmt.Sprintf(", Updated '%s' of type '%s' in namespace '%s'", resourceName, upgradeFuncs.ResourceType, config.Namespace)
+			logrus.Infof("Changes detected in '%s' of type '%s' in namespace '%s'; updated '%s' of type '%s' in namespace '%s'", lastUpdatedConfig.ResourceName, lastUpdatedConfig.Type, lastUpdatedConfig.Namespace, resourceName, upgradeFuncs.ResourceType, lastUpdatedConfig.Namespace)
 
-				logrus.Infof("Changes detected in '%s' of type '%s' in namespace '%s'; updated '%s' of type '%s' in namespace '%s'", config.ResourceName, config.Type, config.Namespace, resourceName, upgradeFuncs.ResourceType, config.Namespace)
-
-				collectors.Reloaded.With(prometheus.Labels{"success": "true"}).Inc()
-				collectors.ReloadedByNamespace.With(prometheus.Labels{"success": "true", "namespace": config.Namespace}).Inc()
-				alert_on_reload, ok := os.LookupEnv("ALERT_ON_RELOAD")
-				if recorder != nil {
-					recorder.Event(item, v1.EventTypeNormal, "Reloaded", message)
-				}
-				if ok && alert_on_reload == "true" {
-					msg := fmt.Sprintf(
-						"Reloader detected changes in *%s* of type *%s* in namespace *%s*. Hence reloaded *%s* of type *%s* in namespace *%s*",
-						config.ResourceName, config.Type, config.Namespace, resourceName, upgradeFuncs.ResourceType, config.Namespace)
-					alert.SendWebhookAlert(msg)
-				}
+			collectors.Reloaded.With(prometheus.Labels{"success": "true"}).Inc()
+			collectors.ReloadedByNamespace.With(prometheus.Labels{"success": "true", "namespace": lastUpdatedConfig.Namespace}).Inc()
+			alert_on_reload, ok := os.LookupEnv("ALERT_ON_RELOAD")
+			if recorder != nil {
+				recorder.Event(item, v1.EventTypeNormal, "Reloaded", message)
+			}
+			if ok && alert_on_reload == "true" {
+				msg := fmt.Sprintf(
+					"Reloader detected changes in *%s* of type *%s* in namespace *%s*. Hence reloaded *%s* of type *%s* in namespace *%s*",
+					lastUpdatedConfig.ResourceName, lastUpdatedConfig.Type, lastUpdatedConfig.Namespace, resourceName, upgradeFuncs.ResourceType, lastUpdatedConfig.Namespace)
+				alert.SendWebhookAlert(msg)
 			}
 		}
 	}
@@ -361,9 +385,9 @@ func PerformActionOnSingleItem(clients kube.Clients, item runtime.Object, config
 func PerformDelayedUpgrade(itemId string) {
 	logrus.Infof("Performing delayed upgrade for '%s'", itemId)
 
+	var item runtime.Object
 	if delayedUpgrade, ok := DelayedUpgrades[itemId]; ok {
 		items := delayedUpgrade.upgradeFuncs.ItemsFunc(delayedUpgrade.clients, delayedUpgrade.namespace)
-		var item runtime.Object
 		for _, i := range items {
 			accessor, err := meta.Accessor(i)
 			if err != nil {
@@ -381,8 +405,11 @@ func PerformDelayedUpgrade(itemId string) {
 		// Get all the values of the configs
 		configs := make([]util.Config, 0)
 		for _, config := range delayedUpgrade.configs {
+			logrus.Info("Adding config %s to delayed update", config.ResourceName)
 			configs = append(configs, config)
 		}
+		delayedUpgrade.updating = true
+		DelayedUpgrades[itemId] = delayedUpgrade
 		err := PerformActionOnSingleItem(delayedUpgrade.clients, item, configs, delayedUpgrade.upgradeFuncs, delayedUpgrade.collectors, delayedUpgrade.recorder, delayedUpgrade.strategy)
 		if err != nil {
 			logrus.Errorf("Delayed update for '%s' failed with error %v", itemId, err)

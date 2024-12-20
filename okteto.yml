@@ -15,3 +15,8 @@ dev:
       capabilities:
         add:
           - SYS_PTRACE
+    environment:
+      - HTTP_PROXY=http://10.32.230.10:3128
+      - HTTPS_PROXY=http://10.32.230.10:3128
+      - NO_PROXY=10.244.0.0/16,10.96.0.0/12,web.threema.ch,0.0.0.0,localhost,127.0.0.1,kind-control-plane,kind-worker,kind-worker2,kind-worker3,kind-worker4,fedora.fritz.box,fedora
+    serviceAccount: okteto-admin
