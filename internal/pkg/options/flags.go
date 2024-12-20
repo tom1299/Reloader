@@ -26,7 +26,8 @@ var (
 	AutoSearchAnnotation = "reloader.stakater.com/search"
 	// SearchMatchAnnotation is an annotation to tag secrets to be found with
 	// AutoSearchAnnotation
-	SearchMatchAnnotation = "reloader.stakater.com/match"
+	SearchMatchAnnotation    = "reloader.stakater.com/match"
+	DelayedUpgradeAnnotation = "reloader.stakater.com/delayed-upgrade"
 	// LogFormat is the log format to use (json, or empty string for default)
 	LogFormat = ""
 	// LogLevel is the log level to use (trace, debug, info, warning, error, fatal and panic)

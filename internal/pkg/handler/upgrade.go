@@ -27,6 +27,19 @@ import (
 	"k8s.io/client-go/tools/record"
 )
 
+var DelayedUpgrades = make(map[string]DelayedUpgrade)
+
+type DelayedUpgrade struct {
+	ItemID       string
+	namespace    string
+	clients      kube.Clients
+	configs      map[string]util.Config
+	upgradeFuncs callbacks.RollingUpgradeFuncs
+	collectors   metrics.Collectors
+	recorder     record.EventRecorder
+	strategy     invokeStrategy
+}
+
 // GetDeploymentRollingUpgradeFuncs returns all callback funcs for a deployment
 func GetDeploymentRollingUpgradeFuncs() callbacks.RollingUpgradeFuncs {
 	return callbacks.RollingUpgradeFuncs{
@@ -193,17 +206,28 @@ func PerformAction(clients kube.Clients, config util.Config, upgradeFuncs callba
 	items := upgradeFuncs.ItemsFunc(clients, config.Namespace)
 
 	for _, i := range items {
-		// find correct annotation and update the resource
-		annotations := upgradeFuncs.AnnotationsFunc(i)
+		err := PerformActionOnSingleItem(clients, i, []util.Config{config}, upgradeFuncs, collectors, recorder, strategy)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func PerformActionOnSingleItem(clients kube.Clients, item runtime.Object, configs []util.Config, upgradeFuncs callbacks.RollingUpgradeFuncs, collectors metrics.Collectors, recorder record.EventRecorder, strategy invokeStrategy) error {
+	for _, config := range configs {
+
+		annotations := upgradeFuncs.AnnotationsFunc(item)
 		annotationValue, found := annotations[config.Annotation]
 		searchAnnotationValue, foundSearchAnn := annotations[options.AutoSearchAnnotation]
 		reloaderEnabledValue, foundAuto := annotations[options.ReloaderAutoAnnotation]
 		typedAutoAnnotationEnabledValue, foundTypedAuto := annotations[config.TypedAutoAnnotation]
 		excludeConfigmapAnnotationValue, foundExcludeConfigmap := annotations[options.ConfigmapExcludeReloaderAnnotation]
 		excludeSecretAnnotationValue, foundExcludeSecret := annotations[options.SecretExcludeReloaderAnnotation]
+		delayedUpgradeAnnotationValue, foundDelayedUpgrade := annotations[options.DelayedUpgradeAnnotation]
 
 		if !found && !foundAuto && !foundTypedAuto && !foundSearchAnn {
-			annotations = upgradeFuncs.PodAnnotationsFunc(i)
+			annotations = upgradeFuncs.PodAnnotationsFunc(item)
 			annotationValue = annotations[config.Annotation]
 			searchAnnotationValue = annotations[options.AutoSearchAnnotation]
 			reloaderEnabledValue = annotations[options.ReloaderAutoAnnotation]
@@ -227,11 +251,47 @@ func PerformAction(clients kube.Clients, config util.Config, upgradeFuncs callba
 			continue
 		}
 
+		if foundDelayedUpgrade {
+			logrus.Infof("Found delayed upgrade annotation for '%s' of type '%s' in namespace '%s'", config.ResourceName, config.Type, config.Namespace)
+			if _, ok := DelayedUpgrades[config.ResourceName]; ok {
+				logrus.Infof("Delayed upgrade for '%s' of type '%s' in namespace '%s' already exists", config.ResourceName, config.Type, config.Namespace)
+				delayedUpgrade := DelayedUpgrades[config.ResourceName]
+				if _, ok := delayedUpgrade.configs[config.ResourceName]; ok {
+					logrus.Infof("Config '%s' is already part of the delayed upgrade for '%s' of type '%s' in namespace '%s'", config.ResourceName, config.ResourceName, config.Type, config.Namespace)
+				} else {
+					delayedUpgrade.configs[config.ResourceName] = config
+					logrus.Infof("Added config '%s' to the delayed upgrade for '%s' of type '%s' in namespace '%s'", config.ResourceName, config.ResourceName, config.Type, config.Namespace)
+				}
+			} else {
+				// Create the delayed upgrade
+				logrus.Infof("Creating new delayed upgrade for '%s' of type '%s' in namespace '%s'", config.ResourceName, config.Type, config.Namespace)
+				delayedUpgrade := DelayedUpgrade{
+					ItemID:       config.ResourceName,
+					namespace:    config.Namespace,
+					clients:      clients,
+					configs:      map[string]util.Config{config.ResourceName: config},
+					upgradeFuncs: upgradeFuncs,
+					collectors:   collectors,
+					recorder:     recorder,
+					strategy:     strategy,
+				}
+				DelayedUpgrades[config.ResourceName] = delayedUpgrade
+				// Create a timer to call the function PerformDelayedUpgrade after a 10 second delay
+				go func(itemId string) {
+					logrus.Infof("Starting timer for delayed upgrade for '%s'", itemId)
+					PerformDelayedUpgrade(itemId)
+				}
+
+			}
+
+			continue
+		}
+
 		result := constants.NotUpdated
 		reloaderEnabled, _ := strconv.ParseBool(reloaderEnabledValue)
 		typedAutoAnnotationEnabled, _ := strconv.ParseBool(typedAutoAnnotationEnabledValue)
 		if reloaderEnabled || typedAutoAnnotationEnabled || reloaderEnabledValue == "" && typedAutoAnnotationEnabledValue == "" && options.AutoReloadAll {
-			result = strategy(upgradeFuncs, i, config, true)
+			result = strategy(upgradeFuncs, item, config, true)
 		}
 
 		if result != constants.Updated && annotationValue != "" {
@@ -240,7 +300,7 @@ func PerformAction(clients kube.Clients, config util.Config, upgradeFuncs callba
 				value = strings.TrimSpace(value)
 				re := regexp.MustCompile("^" + value + "$")
 				if re.Match([]byte(config.ResourceName)) {
-					result = strategy(upgradeFuncs, i, config, false)
+					result = strategy(upgradeFuncs, item, config, false)
 					if result == constants.Updated {
 						break
 					}
@@ -251,17 +311,17 @@ func PerformAction(clients kube.Clients, config util.Config, upgradeFuncs callba
 		if result != constants.Updated && searchAnnotationValue == "true" {
 			matchAnnotationValue := config.ResourceAnnotations[options.SearchMatchAnnotation]
 			if matchAnnotationValue == "true" {
-				result = strategy(upgradeFuncs, i, config, true)
+				result = strategy(upgradeFuncs, item, config, true)
 			}
 		}
 
 		if result == constants.Updated {
-			accessor, err := meta.Accessor(i)
+			accessor, err := meta.Accessor(item)
 			if err != nil {
 				return err
 			}
 			resourceName := accessor.GetName()
-			err = upgradeFuncs.UpdateFunc(clients, config.Namespace, i)
+			err = upgradeFuncs.UpdateFunc(clients, config.Namespace, item)
 			if err != nil {
 				message := fmt.Sprintf("Update for '%s' of type '%s' in namespace '%s' failed with error %v", resourceName, upgradeFuncs.ResourceType, config.Namespace, err)
 				logrus.Errorf("Update for '%s' of type '%s' in namespace '%s' failed with error %v", resourceName, upgradeFuncs.ResourceType, config.Namespace, err)
@@ -269,7 +329,7 @@ func PerformAction(clients kube.Clients, config util.Config, upgradeFuncs callba
 				collectors.Reloaded.With(prometheus.Labels{"success": "false"}).Inc()
 				collectors.ReloadedByNamespace.With(prometheus.Labels{"success": "false", "namespace": config.Namespace}).Inc()
 				if recorder != nil {
-					recorder.Event(i, v1.EventTypeWarning, "ReloadFail", message)
+					recorder.Event(item, v1.EventTypeWarning, "ReloadFail", message)
 				}
 				return err
 			} else {
@@ -282,7 +342,7 @@ func PerformAction(clients kube.Clients, config util.Config, upgradeFuncs callba
 				collectors.ReloadedByNamespace.With(prometheus.Labels{"success": "true", "namespace": config.Namespace}).Inc()
 				alert_on_reload, ok := os.LookupEnv("ALERT_ON_RELOAD")
 				if recorder != nil {
-					recorder.Event(i, v1.EventTypeNormal, "Reloaded", message)
+					recorder.Event(item, v1.EventTypeNormal, "Reloaded", message)
 				}
 				if ok && alert_on_reload == "true" {
 					msg := fmt.Sprintf(
@@ -294,6 +354,43 @@ func PerformAction(clients kube.Clients, config util.Config, upgradeFuncs callba
 		}
 	}
 	return nil
+}
+
+func PerformDelayedUpgrade(itemId string) {
+	logrus.Infof("Performing delayed upgrade for '%s'", itemId)
+
+	if delayedUpgrade, ok := DelayedUpgrades[itemId]; ok {
+		items := delayedUpgrade.upgradeFuncs.ItemsFunc(delayedUpgrade.clients, delayedUpgrade.namespace)
+		var item runtime.Object
+		for _, i := range items {
+			accessor, err := meta.Accessor(i)
+			if err != nil {
+				logrus.Errorf("Failed to get accessor for item %v", i)
+				continue
+			}
+			logrus.Infof("Comparing item %s with %s", accessor.GetName(), itemId)
+			if accessor.GetName() == itemId {
+				item = i
+				logrus.Infof("Found matching item %s", itemId)
+				break
+			}
+		}
+
+		// Get all the values of the configs
+		configs := make([]util.Config, 0)
+		for _, config := range delayedUpgrade.configs {
+			configs = append(configs, config)
+		}
+		err := PerformActionOnSingleItem(delayedUpgrade.clients, item, configs, delayedUpgrade.upgradeFuncs, delayedUpgrade.collectors, delayedUpgrade.recorder, delayedUpgrade.strategy)
+		if err != nil {
+			logrus.Errorf("Delayed update for '%s' failed with error %v", itemId, err)
+		} else {
+			logrus.Infof("Delayed update for '%s' was successful", itemId)
+		}
+		delete(DelayedUpgrades, itemId)
+	} else {
+		logrus.Errorf("Delayed update for '%s' not found", itemId)
+	}
 }
 
 func checkIfResourceIsExcluded(resourceName, excludedResources string) bool {
