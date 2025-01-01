@@ -28,12 +28,15 @@ import (
 	"k8s.io/client-go/tools/record"
 )
 
-var DelayedUpgrades = make(map[string]DelayedUpgrade)
+var DelayedUpgrades = make(map[ItemIdentifier]DelayedUpgrade)
+
+type ItemIdentifier struct {
+	ID        string
+	Namespace string
+}
 
 type DelayedUpgrade struct {
-	ItemID       string
-	namespace    string
-	clients      kube.Clients
+	ItemID       ItemIdentifier
 	configs      map[string]util.Config
 	upgradeFuncs callbacks.RollingUpgradeFuncs
 	collectors   metrics.Collectors
@@ -261,28 +264,26 @@ func PerformActionOnSingleItem(clients kube.Clients, item runtime.Object, config
 
 		if foundDelayedUpgrade {
 			accessor, _ := meta.Accessor(item)
-			itemId := accessor.GetName()
-			logrus.Infof("Found delayed upgrade annotation for '%s' in namespace '%s'", itemId, config.Namespace)
+			itemId := ItemIdentifier{ID: accessor.GetName(), Namespace: config.Namespace}
+			logrus.Infof("Found delayed upgrade annotation for '%s' in namespace '%s'", itemId.ID, itemId.Namespace)
 			if _, ok := DelayedUpgrades[itemId]; ok {
-				logrus.Infof("Delayed upgrade for '%s' already exists", itemId)
+				logrus.Infof("Delayed upgrade for '%s' already exists", itemId.ID)
 
 				delayedUpgrade := DelayedUpgrades[itemId]
 				if delayedUpgrade.updating {
-					logrus.Infof("Delayed upgrade for '%s' is already in progress", itemId)
+					logrus.Infof("Delayed upgrade for '%s' is already in progress", itemId.ID)
 				} else if _, ok := delayedUpgrade.configs[config.ResourceName]; ok {
-					logrus.Infof("Config '%s' is already part of the delayed upgrade for '%s'", config.ResourceName, itemId)
+					logrus.Infof("Config '%s' is already part of the delayed upgrade for '%s'", config.ResourceName, itemId.ID)
 					continue
 				} else {
 					delayedUpgrade.configs[config.ResourceName] = config
-					logrus.Infof("Added config '%s' to the delayed upgrade for '%s'", config.ResourceName, itemId)
+					logrus.Infof("Added config '%s' to the delayed upgrade for '%s'", config.ResourceName, itemId.ID)
 					continue
 				}
 			} else {
-				logrus.Infof("Creating new delayed upgrade for '%s' for config '%s'", itemId, config.ResourceName)
+				logrus.Infof("Creating new delayed upgrade for '%s' for config '%s'", itemId.ID, config.ResourceName)
 				delayedUpgrade := DelayedUpgrade{
 					ItemID:       itemId,
-					namespace:    config.Namespace,
-					clients:      clients,
 					configs:      map[string]util.Config{config.ResourceName: config},
 					upgradeFuncs: upgradeFuncs,
 					collectors:   collectors,
@@ -291,7 +292,7 @@ func PerformActionOnSingleItem(clients kube.Clients, item runtime.Object, config
 					updating:     false,
 					delayedFunc: func() {
 						<-time.After(10 * time.Second)
-						logrus.Infof("Timer fired for delayed upgrade for '%s'", itemId)
+						logrus.Infof("Timer fired for delayed upgrade for '%s'", itemId.ID)
 						PerformDelayedUpgrade(itemId)
 					},
 				}
@@ -382,22 +383,23 @@ func PerformActionOnSingleItem(clients kube.Clients, item runtime.Object, config
 	return nil
 }
 
-func PerformDelayedUpgrade(itemId string) {
-	logrus.Infof("Performing delayed upgrade for '%s'", itemId)
+func PerformDelayedUpgrade(itemId ItemIdentifier) {
+	clients := kube.GetClients()
+	logrus.Infof("Performing delayed upgrade for '%s'", itemId.ID)
 
 	var item runtime.Object
 	if delayedUpgrade, ok := DelayedUpgrades[itemId]; ok {
-		items := delayedUpgrade.upgradeFuncs.ItemsFunc(delayedUpgrade.clients, delayedUpgrade.namespace)
+		items := delayedUpgrade.upgradeFuncs.ItemsFunc(clients, itemId.Namespace)
 		for _, i := range items {
 			accessor, err := meta.Accessor(i)
 			if err != nil {
 				logrus.Errorf("Failed to get accessor for item %v", i)
 				continue
 			}
-			logrus.Infof("Comparing item %s with %s", accessor.GetName(), itemId)
-			if accessor.GetName() == itemId {
+			logrus.Infof("Comparing item %s with %s", accessor.GetName(), itemId.ID)
+			if accessor.GetName() == itemId.ID {
 				item = i
-				logrus.Infof("Found matching item %s", itemId)
+				logrus.Infof("Found matching item %s", itemId.ID)
 				break
 			}
 		}
@@ -410,15 +412,15 @@ func PerformDelayedUpgrade(itemId string) {
 		}
 		delayedUpgrade.updating = true
 		DelayedUpgrades[itemId] = delayedUpgrade
-		err := PerformActionOnSingleItem(delayedUpgrade.clients, item, configs, delayedUpgrade.upgradeFuncs, delayedUpgrade.collectors, delayedUpgrade.recorder, delayedUpgrade.strategy)
+		err := PerformActionOnSingleItem(clients, item, configs, delayedUpgrade.upgradeFuncs, delayedUpgrade.collectors, delayedUpgrade.recorder, delayedUpgrade.strategy)
 		if err != nil {
-			logrus.Errorf("Delayed update for '%s' failed with error %v", itemId, err)
+			logrus.Errorf("Delayed update for '%s' failed with error %v", itemId.ID, err)
 		} else {
-			logrus.Infof("Delayed update for '%s' was successful", itemId)
+			logrus.Infof("Delayed update for '%s' was successful", itemId.ID)
 		}
 		delete(DelayedUpgrades, itemId)
 	} else {
-		logrus.Errorf("Delayed update for '%s' not found", itemId)
+		logrus.Errorf("Delayed update for '%s' not found", itemId.ID)
 	}
 }
 
