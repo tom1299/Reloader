@@ -3,6 +3,7 @@ package callbacks
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/sirupsen/logrus"
@@ -51,6 +52,14 @@ type RollingUpgradeFuncs struct {
 	VolumesFunc        VolumesFunc
 	ResourceType       string
 }
+
+// DelayedResources contains a delay in seconds and an array of runtime objects
+type DelayedResources struct {
+	delayInSeconds int
+	resources      []runtime.Object
+}
+
+var delayedResources = make(map[string]DelayedResources)
 
 // GetDeploymentItems returns the deployments in given namespace
 func GetDeploymentItems(clients kube.Clients, namespace string) []runtime.Object {
@@ -331,8 +340,46 @@ func GetRolloutInitContainers(item runtime.Object) []v1.Container {
 // UpdateDeployment performs rolling upgrade on deployment
 func UpdateDeployment(clients kube.Clients, namespace string, resource runtime.Object) error {
 	deployment := resource.(*appsv1.Deployment)
+	resourceInfo := GetResourceInfo(deployment)
+	delay := GetDelayAnnotationValue(deployment)
+	if delay != "" {
+		logrus.Debugf("Update for delayed deployment %s with delay %s requested", resourceInfo, delay)
+		existingDelayedResources, ok := delayedResources[resourceInfo]
+		if ok {
+			existingDelayedResources.resources = append(existingDelayedResources.resources, deployment)
+			delayedResources[resourceInfo] = existingDelayedResources
+			logrus.Debugf("Added deployment %s to existing delayed resources", resourceInfo)
+		} else {
+			delayInSeconds, err := time.ParseDuration(delay)
+			if err != nil {
+				logrus.Errorf("Failed to parse delay %s for deployment %s", delay, resourceInfo)
+				return err
+			}
+			delayedResources[resourceInfo] = DelayedResources{delayInSeconds: int(delayInSeconds.Seconds()), resources: []runtime.Object{deployment}}
+			logrus.Debugf("Added deployment %s to delayed resources", resourceInfo)
+			time.AfterFunc(time.Duration(delayInSeconds.Seconds())*time.Second, func() {
+				err := mergeResources(clients, resourceInfo)
+				if err != nil {
+					logrus.Errorf("Failed to merge delayed resources for %s: %v", resourceInfo, err)
+				}
+				delete(delayedResources, resourceInfo)
+			})
+		}
+	}
+
 	_, err := clients.KubernetesClient.AppsV1().Deployments(namespace).Update(context.TODO(), deployment, meta_v1.UpdateOptions{FieldManager: "Reloader"})
 	return err
+}
+
+// GetResourceInfo returns a string consisting of type, name, and namespace of a runtime object
+func GetResourceInfo(resource runtime.Object) string {
+	return fmt.Sprintf("%s-%s-%s", resource.GetObjectKind().GroupVersionKind().Kind, resource.(meta_v1.Object).GetNamespace(), resource.(meta_v1.Object).GetName())
+}
+
+// GetDelayAnnotationValue returns the value of the "delay" annotation from the given runtime.Object
+func GetDelayAnnotationValue(item runtime.Object) string {
+	annotations := item.(meta_v1.Object).GetAnnotations()
+	return annotations["delay"]
 }
 
 // CreateJobFromCronjob performs rolling upgrade on cronjob
@@ -447,4 +494,57 @@ func GetDeploymentConfigVolumes(item runtime.Object) []v1.Volume {
 // GetRolloutVolumes returns the Volumes of given rollout
 func GetRolloutVolumes(item runtime.Object) []v1.Volume {
 	return item.(*argorolloutv1alpha1.Rollout).Spec.Template.Spec.Volumes
+}
+
+// mergeResources merges delayed resources into the latest version of a deployment
+func mergeResources(clients kube.Clients, resourceInfo string) error {
+	logrus.Debugf("Merging delayed resources for %s", resourceInfo)
+	delayedResource, exists := delayedResources[resourceInfo]
+	if !exists {
+		return fmt.Errorf("no delayed resources found for %s", resourceInfo)
+	}
+
+	// Get the latest version of the deployment
+	namespace, name := getNamespaceAndName(resourceInfo)
+	logrus.Debugf("Getting latest deployment with name %s from namespace %s", name, namespace)
+	latestDeployment, err := clients.KubernetesClient.AppsV1().Deployments(namespace).Get(context.TODO(), name, meta_v1.GetOptions{})
+	if err != nil {
+		return fmt.Errorf("failed to get latest deployment %s: %v", resourceInfo, err)
+	}
+
+	// Iterate in reverse order over the delayed resources
+	logrus.Debugf("Delayed updates to deployment %s: %d", resourceInfo, len(delayedResource.resources))
+	for i := len(delayedResource.resources) - 1; i >= 0; i-- {
+		resource := delayedResource.resources[i].(*appsv1.Deployment)
+		for _, container := range resource.Spec.Template.Spec.Containers {
+			logrus.Debugf("Updating container %s in deployment %s", container.Name, resourceInfo)
+			for _, envVar := range container.Env {
+				// Update env var
+				for k, latestContainer := range latestDeployment.Spec.Template.Spec.Containers {
+					if latestContainer.Name == container.Name {
+						logrus.Debugf("Updating env var %s in container %s", envVar.Name, container.Name)
+						for l, latestEnvVar := range latestContainer.Env {
+							if latestEnvVar.Name == envVar.Name {
+								logrus.Debugf("Updating env var %s in container %s with value %s", envVar.Name, container.Name, envVar.Value)
+								latestDeployment.Spec.Template.Spec.Containers[k].Env[l].Value = envVar.Value
+								break
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+
+	// Replace annotations with the newest element's annotations
+	latestDeployment.Spec.Template.ObjectMeta.Annotations = delayedResource.resources[len(delayedResource.resources)-1].(*appsv1.Deployment).Spec.Template.ObjectMeta.Annotations
+
+	_, err = clients.KubernetesClient.AppsV1().Deployments(namespace).Update(context.TODO(), latestDeployment, meta_v1.UpdateOptions{FieldManager: "Reloader"})
+	return err
+}
+
+// getNamespaceAndName extracts namespace and name from resourceInfo
+func getNamespaceAndName(resourceInfo string) (string, string) {
+	parts := strings.Split(resourceInfo, "-")
+	return parts[1], parts[2]
 }
